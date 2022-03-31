@@ -1,7 +1,7 @@
 <img src="./resources/cuer_logo_black_bg.jpg" alt="drawing" width="200"/>
 
 # Battery Management Unit (BMU)
-This repo contains the code for the BMU on Helia. It is broadly the same as the version in the [CUER Embedded BMU repo](https://github.com/CUER/Embedded/blob/master/BMU/main.cpp) with updated code compatible with mbedOS 6 and addition of printf for debugging purposes. The BMU (located in the HV box) works in conjunction with the Pack Control Unit (PCU, located in the battery pack) to control the relays in the HV system of the car.
+This repo contains the code for the BMU on Helia. It is broadly the same as the version in the [CUER Embedded BMU repo](https://github.com/CUER/Embedded/blob/master/BMU/main.cpp) with updated code compatible with mbedOS 6 and changes made to adapt to the current state of Helia. The BMU (located in the HV box) works in conjunction with the Pack Control Unit (PCU, located in the battery pack) to control the relays in the HV system of the car.
 
 ## Functionality
 Below is a high level diagram of Helia's HV system .
@@ -13,11 +13,11 @@ Below is a high level diagram of Helia's HV system .
 | Discharge | Once the main contactors have been opened by the PCU, open HVDC relay to isolate HV Box. Then, engage discharge relay to discharge HV box capacitors to a safe voltage |
 | Solar Relay Control | To be added in |
 | HV Box Fan Control | To be added in |
-| Cell temperature/voltage monitoring | Make decisions based off cell temperature and voltage readings (i.e. shut everything off if there a cell is over/under voltage/temperature) |
-| IVT monitoring | Configures the IVT and monitors current; if max charging or discharging current is exceeded then shut everything off |
+| Cell temperature/voltage monitoring (currently disabled, cell voltage monitoring works for one battery pack but not the other, cell temperature monitoring is not functioning) | Make decisions based off cell temperature and voltage readings (i.e. shut everything off if there a cell is over/under voltage/temperature), |
+| IVT monitoring | Configures both the IVT in both battery packs, monitors current, voltage and temperature;if max charging or discharging current is exceeded then shut everything off |
 
 ## Application functionality
-The BMU listens to CAN message from other MCUs (such as the driver control board and PCU) and updates the status of the car/set certain flags.  It also check cells' current, voltage and temperature measurements. Based on these information, it will make a decision as to whether to it should engage/disengage the precharge and discharge relays.
+The BMU listens to CAN message from other MCUs (such as the driver control board and PCU) and updates the status of the car/set certain flags.  It also check IVT's current, voltage and temperature measurements. Based on these information, it will make a decision as to whether to it should engage/disengage the precharge and discharge relays.
 
 ## Building and running
 Clone this project and load it in Mbed Studio. You can build and run the program on it.
