@@ -1,5 +1,5 @@
 /*****************************************************************************************************\
- CUER BMU v3.1 Code by Vincent (March 2022)
+ CUER BMU v3.1 Code by Vincent (April 2022)
 
  Functionality:
 
@@ -9,7 +9,7 @@
     Discharge: When main contactors are opened, Open HV box contactor to isolate HV Box. Then, engage 
     discharge relay to discharge HV box capacitors to a safe voltage.
 
-    Solar Relay Control: to be added in
+    Solar Relay Control (currently disabled): Control solar relay
 
     HV Box Fan Control: to be added in once we have a way of measuring HV box temperature
 
@@ -25,8 +25,11 @@
 //TO DO: ADD TIMEOUT FOR CELL TEMPERATURE, IVT AND CELL VOLTAGE READINGS
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <mbed.h>
+
+#include "bmu.h"
 
 // DEBUG flag
 #define BMU_DEBUG 1 
@@ -70,32 +73,27 @@ using namespace std::chrono;
 \*****************************************************************************************************/
 
 //BMU heartbeat CAN ID
-const int BMU_CAN_ID = 0x400;
+const int32_t BMU_CAN_ID = 0x400;
 
 //Driver Controls CAN ID
-const int DRIVER_CONTROLS_ID = 0x500;
+const int32_t DRIVER_CONTROLS_ID = 0x500;
 
 //PCU CAN IDs
-const int CELL_VOLTAGES_01_04 = 0x360;
-const int CELL_VOLTAGES_05_08 = 0x361;
-const int CELL_VOLTAGES_09_12 = 0x362;
-const int CELL_VOLTAGES_13_16 = 0x363;
-const int CELL_VOLTAGES_17    = 0x364;
-const int CELL_VOLTAGES_18_21 = 0x365;
-const int CELL_VOLTAGES_22_25 = 0x366;
-const int CELL_VOLTAGES_26_29 = 0x367;
-const int CELL_VOLTAGES_30_33 = 0x368;
-const int CELL_VOLTAGES_34    = 0x369;
-const int PCU_STATUS_FRONT    = 0x340;
-const int PCU_STATUS_REAR     = 0x341;
+const int32_t CELL_VOLTAGES_BASE_ID = 0x360;
+const int32_t PCU_STATUS_FRONT    = 0x340;
+const int32_t PCU_STATUS_REAR     = 0x341;
 
 DigitalOut prechg_enable(PRECHG_ENABLE);
 DigitalOut dischg_disable(DISCHG_DISABLE);
 DigitalOut hvdc_enable(HVDC_ENABLE);
 DigitalIn prechg_detect(PRECHG_DETECT);
 
-DigitalOut voltage_led(LED2);
-DigitalOut current_led(LED1);
+// LEDs output to display status
+DigitalOut safe_indic(LED1);
+DigitalOut contactor_indic(LED2);
+DigitalOut solar_indic(LED3);
+DigitalOut charge_indic(LED4);
+DigitalOut solar_enable(p11);
 
 
 //Serial port for debugging. Note that overuse of pc.printf() can mess up the CAN routines.
@@ -105,8 +103,12 @@ DigitalOut current_led(LED1);
 //CAN setup
 CAN can(p30, p29);
 CANMessage received_msg;
-int result;
 
+bmu_state_t BMU;
+ivt_state_t ivt_front;
+ivt_state_t ivt_rear;
+
+/*
 // Variables to store status of front IVT
 int front_IVT_voltage;
 int front_IVT_current;
@@ -122,10 +124,10 @@ int rear_IVT_charge;
 int rear_IVT_temperature;
 int rear_IVT_power;
 int rear_IVT_energy;
-
+*/
 //Cell voltages and temperatures stored in these arrays. We have more than enough RAM to do this.
-uint16_t cell_voltages[34];
-uint8_t cell_temperatures[34][6];
+uint16_t cell_voltages[32];
+uint8_t cell_temperatures[2][8];
 
 // Max and min battery pack voltages, as well as voltage hysteresis, in 1mV. These don't change.
 const int max_battery_pack_voltage_mv = MAX_BATTERY_PACK_VOTAGE_MV;
@@ -167,7 +169,7 @@ bool can_send(CANMessage msg);
 void CANDataSentCallback(void);
 void precharge(void);
 void discharge(void);
-void update_contactors(void);
+void update_relays(void);
 void check_cells(void);
 void update_BMU_status_array(void);
 void config_IVT(void);
@@ -183,17 +185,20 @@ unsigned long IVT_time;
 bool CAN_data_sent;
 bool heartbeat_flag;
 bool error_flag;
-bool over_voltage_flag;
-bool under_voltage_flag;
-bool over_temperature_flag;
-bool under_temperature_flag;
-bool ignition;
+bool over_voltage_flag = false;
+bool under_voltage_flag = false;
+bool over_temperature_flag = false;
+bool under_temperature_flag = false;
+bool ignition_demand = false;
+bool previous_ignition_demand = false;
+bool solar_demand = false;
 bool currently_precharging;
 bool currently_discharging;
 
 //various CAN messages set up as char arrays.
 char contactor_array[1];
 char BMU_status_array[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
 //IVT config messages
 char stop_mode[5] = {0x34, 0x00, 0x00, 0x00, 0x00};
 char start_mode[5] = {0x34, 0x01, 0x01, 0x00, 0x00};
@@ -219,6 +224,7 @@ CANMessage charge_setup_msg(0x411, IVT_charge_setup, 4);
 CANMessage power_setup_msg(0x411, IVT_power_setup, 4);
 CANMessage energy_setup_msg(0x411, IVT_energy_setup, 4);
 
+/*
 //A struct to contain all the stuff the BMU puts in its heartbeat
 struct BMU_status {
     bool over_current;
@@ -236,15 +242,36 @@ struct BMU_status {
     uint8_t fan3_state;
     uint8_t fan4_state;
 } BMU;
+*/
 
 //This is used to store the error flags; you'll see its use later in the main loop.
 char previous_status = 0x00;
 
+static int ivt_max_current(void)
+{
+  return ivt_front.current > ivt_rear.current ? ivt_front.current : ivt_rear.current;
+}
+
+static int ivt_min_current(void)
+{
+  return ivt_front.current > ivt_rear.current ? ivt_front.current : ivt_rear.current;
+}
+
+static int ivt_max_voltage1(void)
+{
+  return ivt_front.voltage1 > ivt_rear.voltage1 ? ivt_front.voltage1 : ivt_rear.voltage1;
+}
+
+static int ivt_min_voltage1(void)
+{
+  return ivt_front.voltage1 < ivt_rear.voltage1 ? ivt_front.voltage1 : ivt_rear.voltage1;
+}
+
 int main(void) {
     //Initialise the BMU with all the error flags set for safety, and the safe to drive flag cleared
-    BMU.over_voltage = 1;
-    BMU.under_voltage = 1;
-    BMU.over_current = 1;
+    BMU.over_voltage = 0;
+    BMU.under_voltage = 0;
+    BMU.over_current = 0;
     //BMU.under_temperature = 0;
     //BMU.over_temperature = 1;
     BMU.safe_to_drive = 0;
@@ -285,129 +312,156 @@ int main(void) {
  Tells the BMU what to do with each different message ID in a big switch statement 
 \*****************************************************************************************************/
 void CANRecieveRoutine (void) {
-    result = can.read(received_msg);
+    can.read(received_msg);
     switch(received_msg.id) {
-    //cases 0x320 - 0x329 are cell voltage readings from the PCU.
-    //If time permits can shorten this to a "case 0x320 ... 0x323, case 0x324, case 0x325 ... 0x328, case 0x329"
-    case CELL_VOLTAGES_01_04:
-        cell_voltages[0] = (received_msg.data[0]) | (received_msg.data[1] << 8);
-        cell_voltages[1] = (received_msg.data[2]) | (received_msg.data[3] << 8);
-        cell_voltages[2] = (received_msg.data[4]) | (received_msg.data[5] << 8);
-        cell_voltages[3] = (received_msg.data[6]) | (received_msg.data[7] << 8);
-        break;
-    case CELL_VOLTAGES_05_08:
-        cell_voltages[4] = (received_msg.data[0]) | (received_msg.data[1] << 8);
-        cell_voltages[5] = (received_msg.data[2]) | (received_msg.data[3] << 8);
-        cell_voltages[6] = (received_msg.data[4]) | (received_msg.data[5] << 8);
-        cell_voltages[7] = (received_msg.data[6]) | (received_msg.data[7] << 8);
-        break;
-    case CELL_VOLTAGES_09_12:
-        cell_voltages[8] = (received_msg.data[0]) | (received_msg.data[1] << 8);
-        cell_voltages[9] = (received_msg.data[2]) | (received_msg.data[3] << 8);
-        cell_voltages[10] = (received_msg.data[4]) | (received_msg.data[5] << 8);
-        cell_voltages[11] = (received_msg.data[6]) | (received_msg.data[7] << 8);
-        break;
-    case CELL_VOLTAGES_13_16:
-        cell_voltages[12] = (received_msg.data[0]) | (received_msg.data[1] << 8);
-        cell_voltages[13] = (received_msg.data[2]) | (received_msg.data[3] << 8);
-        cell_voltages[14] = (received_msg.data[4]) | (received_msg.data[5] << 8);
-        cell_voltages[15] = (received_msg.data[6]) | (received_msg.data[7] << 8);
-        break;
-    case CELL_VOLTAGES_17:
-        cell_voltages[16] = (received_msg.data[0]) | (received_msg.data[1] << 8);
-        break;
-    case CELL_VOLTAGES_18_21:
-        cell_voltages[17] = (received_msg.data[0]) | (received_msg.data[1] << 8);
-        cell_voltages[18] = (received_msg.data[2]) | (received_msg.data[3] << 8);
-        cell_voltages[19] = (received_msg.data[4]) | (received_msg.data[5] << 8);
-        cell_voltages[20] = (received_msg.data[6]) | (received_msg.data[7] << 8);
-        break;
-    case CELL_VOLTAGES_22_25:
-        cell_voltages[21] = (received_msg.data[0]) | (received_msg.data[1] << 8);
-        cell_voltages[22] = (received_msg.data[2]) | (received_msg.data[3] << 8);
-        cell_voltages[23] = (received_msg.data[4]) | (received_msg.data[5] << 8);
-        cell_voltages[24] = (received_msg.data[6]) | (received_msg.data[7] << 8);
-        break;
-    case CELL_VOLTAGES_26_29:
-        cell_voltages[25] = (received_msg.data[0]) | (received_msg.data[1] << 8);
-        cell_voltages[26] = (received_msg.data[2]) | (received_msg.data[3] << 8);
-        cell_voltages[27] = (received_msg.data[4]) | (received_msg.data[5] << 8);
-        cell_voltages[28] = (received_msg.data[6]) | (received_msg.data[7] << 8);
-        break;
-    case CELL_VOLTAGES_30_33:
-        cell_voltages[29] = (received_msg.data[0]) | (received_msg.data[1] << 8);
-        cell_voltages[30] = (received_msg.data[2]) | (received_msg.data[3] << 8);
-        cell_voltages[31] = (received_msg.data[4]) | (received_msg.data[5] << 8);
-        cell_voltages[32] = (received_msg.data[6]) | (received_msg.data[7] << 8);
-        break;
-    case CELL_VOLTAGES_34:
-        cell_voltages[33] = (received_msg.data[0]) | (received_msg.data[1] << 8);
-        break;  
-    //Ignition message received by the Driver Controls board 
-    case DRIVER_CONTROLS_ID:
-        ignition = (received_msg.data[0] & 0x01);
-        break;
-    //Messages 0x520 - 0x527 are front IVT messages.
-    case 0x520:
-        front_IVT_current = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        // For IVT_timeout
-        IVT_timer.stop();
-        IVT_time = duration_cast<milliseconds>(IVT_timer.elapsed_time()).count();
-        IVT_timer.reset();
-        IVT_timer.start();
-        break;
-    case 0x521:
-        front_IVT_voltage = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        break;
-    //We don't want U2 and U3 voltage readings. If the IVT is sending these (it always will when restarted) we need to configure it
-    case 0x522 ... 0x523:
-        config_IVT();
-        break;
-    case 0x524:
-        front_IVT_temperature = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        break;
-    case 0x525:
-        front_IVT_power = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        break;
-    case 0x526:
-        front_IVT_charge = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        break;
-    case 0x527:
-        front_IVT_energy = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        break;  
-    //Messages 0x530 - 0x537 are rear IVT messages.
-    case 0x530:
-        rear_IVT_current = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        // For IVT_timeout
-        IVT_timer.stop();
-        IVT_time = duration_cast<milliseconds>(IVT_timer.elapsed_time()).count();
-        IVT_timer.reset();
-        IVT_timer.start();
-        break;
-    case 0x531:
-        rear_IVT_voltage = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        break;
-    //We don't want U2 and U3 voltage readings. If the IVT is sending these (it always will when restarted) we need to configure it
-    case 0x532 ... 0x533:
-        config_IVT();
-        break;
-    case 0x534:
-        rear_IVT_temperature = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        break;
-    case 0x535:
-        rear_IVT_power = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        break;
-    case 0x536:
-        rear_IVT_charge = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        break;
-    case 0x537:
-        rear_IVT_energy = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
-        break;
-    //Cell temperature messages, they give erratic readings so not reliable, they are stored by not used
-    case 0x550 ... 0x572:
-        for(int i = 0; i < 6; i++) {
-            cell_temperatures[received_msg.id - 0x550][i] = received_msg.data[i];
+        //cases 0x360 - 0x367 are cell voltage readings from the PCU.
+        case CELL_VOLTAGES_BASE_ID ... CELL_VOLTAGES_BASE_ID + 0x7:
+        {
+            // The for loop basically does the following
+            // cell_voltages[0] = (received_msg.data[0]) | (received_msg.data[1] << 8);
+            // cell_voltages[1] = (received_msg.data[2]) | (received_msg.data[3] << 8);
+            // cell_voltages[2] = (received_msg.data[4]) | (received_msg.data[5] << 8);
+            // cell_voltages[3] = (received_msg.data[6]) | (received_msg.data[7] << 8);
+            for (int i = 0; i < 4; i++)
+            {
+                int index = (received_msg.id - CELL_VOLTAGES_BASE_ID)*4 + i;
+                cell_voltages[index]
+                = ((uint8_t*)received_msg.data)[i*2] | (((uint8_t*)received_msg.data)[i*2 + 1] << 8);
+            }
+            break;
         }
+
+        //Ignition message received by the Driver Controls board 
+        case DRIVER_CONTROLS_ID:
+        {
+            bool ig = (received_msg.data[0] & 0x01);
+            if (ignition_demand != ig)
+            {
+                previous_ignition_demand = ignition_demand;
+                ignition_demand = ig;
+            }
+            solar_demand = (bool)(received_msg.data[0] & 0x08);
+            break;
+        }
+
+        //Messages 0x520 - 0x527 are front IVT messages.
+        case 0x520:
+        {
+            ivt_front.current = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            // For IVT_timeout
+            IVT_timer.stop();
+            IVT_time = duration_cast<milliseconds>(IVT_timer.elapsed_time()).count();
+            IVT_timer.reset();
+            IVT_timer.start();
+            break;
+        }
+
+        case 0x521:
+        {
+            ivt_front.voltage1 = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            break;
+        }
+        
+        //We don't want U2 and U3 voltage readings. If the IVT is sending these (it always will when restarted) we need to configure it
+        case 0x522 ... 0x523:
+        {
+            config_IVT();
+            break;
+        }
+        
+        case 0x524:
+        {
+            ivt_front.temperature = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            break;
+        }
+        case 0x525:
+        {
+            ivt_front.power = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            break;
+        }
+
+        case 0x526:
+        {   
+            ivt_front.charge = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            break;
+        }
+
+        case 0x527:
+        {
+            ivt_front.energy = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            break;  
+        } 
+        
+        //Messages 0x530 - 0x537 are rear IVT messages.
+        case 0x530:
+        {
+            ivt_rear.current = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            // For IVT_timeout
+            IVT_timer.stop();
+            IVT_time = duration_cast<milliseconds>(IVT_timer.elapsed_time()).count();
+            IVT_timer.reset();
+            IVT_timer.start();
+            break;
+        }
+        
+        case 0x531:
+        {
+            ivt_rear.voltage1 = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            break;
+        }
+        
+        //We don't want U2 and U3 voltage readings. If the IVT is sending these (it always will when restarted) we need to configure it
+        case 0x532 ... 0x533:
+        {
+            config_IVT();
+            break;
+        }
+        
+        case 0x534:
+        {
+            ivt_rear.temperature = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            break;
+        }
+        
+        case 0x535:
+        {
+            ivt_rear.power = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            break;
+        }
+        
+        case 0x536:
+        {
+            ivt_rear.charge = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            break;
+        }
+        
+        case 0x537:
+        {
+            ivt_rear.energy = (received_msg.data[5]) | (received_msg.data[4] << 8) | (received_msg.data[3] << 16) | (received_msg.data[2] << 24);
+            break;
+        }
+        
+        // Cell temperature messages
+        // case 0x550 ... 0x56f:
+        case 0x550:
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                cell_temperatures[0][i] = received_msg.data[i];
+            }
+            break;
+        }
+        
+        case 0x562:
+        {
+            for (int i = 0; i < 8; i++) {
+                cell_temperatures[1][i] = received_msg.data[i];
+            }
+            break;
+        }
+
+        default:
+            break;
     }
 }
 
@@ -475,7 +529,18 @@ void beat(void) {
     CANMessage BMU_status_msg(BMU_CAN_ID, BMU_status_array, 6);
     can_send(BMU_status_msg);
 
-    update_contactors();
+    /* Disable solar for now
+    if (solar_enable)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            CANMessage mppt(0x650 + (0x10 * i) + 8, "\x64", 1);
+            can_send(mppt);
+        }
+    }
+    */
+
+    update_relays();
 }
 
 /*****************************************************************************************************\
@@ -548,14 +613,15 @@ void discharge(void) {
  This is only called in the beat() function but I've kept it separate so we can call it on its own
  if desired.
 \*****************************************************************************************************/
-void update_contactors(void) {
+void update_relays(void) {
     //Self explanatory, if the car is on and it's safe then turn on contactors & precharge if needed
-    if(ignition == 1 && BMU.safe_to_drive) {
+    if(ignition_demand && !previous_ignition_demand && BMU.safe_to_drive) {
         if (BMU_DEBUG)
         {
-            printf("Contactors engaged. \n");
+            printf("Contactors are engaged. \n");
         }
         contactor_array[0] = 0x01;
+        contactor_indic = 1;
         CANMessage contactor_msg(0x34F, contactor_array, 1);
         can_send(contactor_msg);
         if(!BMU.precharge_state)
@@ -572,7 +638,7 @@ void update_contactors(void) {
     else {
         if (BMU_DEBUG)
         {
-            printf("Contactors disengaged. \n");
+            printf("Contactors are disengaged. \n");
         }
         contactor_array[0] = 0x00;
         CANMessage contactor_msg(0x34F, contactor_array, 1);
@@ -585,6 +651,9 @@ void update_contactors(void) {
             }
             discharge();
         }
+
+        solar_enable = (solar_demand && BMU.safe_to_drive);
+        solar_indic = solar_enable;
     }
 }
 
@@ -594,32 +663,34 @@ void update_contactors(void) {
 \*****************************************************************************************************/
 void check_cells(void) {
     //Check whether we are charging
-    if(front_IVT_current < 0 || rear_IVT_current < 0)
+    if(ivt_max_current() < 0)
     {
         if (BMU_DEBUG)
         {
             printf("BMU detected charging through IVT.\n");
-            printf("front_IVT_current: %d mA, rear_IVT_current: %d mA \n", front_IVT_current, rear_IVT_current);
+            printf("front_IVT_current: %d mA, rear_IVT_current: %d mA \n", ivt_front.current, ivt_rear.current);
         }
         BMU.charging_state = true;
+        charge_indic = 1;
     }
     else
     {
         BMU.charging_state = false;
+        charge_indic = 0;
     }
     //Check the max current isn't exceeded in both charging and discharging directions for both IVTs
-    if(front_IVT_current >= max_current || front_IVT_current < max_charging_current || rear_IVT_current >= max_current || rear_IVT_current < max_charging_current) {
+    if(ivt_max_current() >= max_current || ivt_min_current() < max_charging_current) {
         if (BMU_DEBUG)
         {
             printf("BMU detected over current through IVT.\n");
-            printf("front_IVT_current: %d mA, rear_IVT_current: %d mA \n", front_IVT_current, rear_IVT_current);
+            printf("front_IVT_current: %d mA, rear_IVT_current: %d mA \n", ivt_front.current, ivt_rear.current);
         }
         BMU.over_current = true;
-        current_led = 1;
+        // current_led = 1;
     }
     else {
         BMU.over_current = false;
-        current_led = 0;
+        // current_led = 0;
     }
     //This bit is for the subsequent iterations of the code, to add some hysteresis into the under/over-voltage triggers
     if(over_voltage_flag)
@@ -634,16 +705,25 @@ void check_cells(void) {
     //Clear these flags before checking the cells, set them if we detect an over/under-voltage cell
     over_voltage_flag = false;
     under_voltage_flag = false;
-
-    // Because cell monitoring is only working for cells in one of the battery pack, enable the following code will lead to 
-    // under voltage as the other CMU gives 0x00 voltage readings.
+    
     /*
-    for(int i = 0; i < 17; i++) {
-        if(cell_voltages[i] < temp_min_cell_voltage) {
+    // Cell monitoring is only working for cells in one of the battery pack, disabled for now
+    // Check individual cell voltages
+    for(int i = 0; i < 32; i++) 
+    {
+        // Final 16 cell voltages are reporting all zero so not checking
+        if (i >= 16)
+        {
+            // XXX bodge:
+            continue;
+        }
+        
+        
+        if (cell_voltages[i] < tmp_min_cell_voltage) {
             BMU.under_voltage = true;
             under_voltage_flag = true;
         }
-        if(cell_voltages[i] > temp_max_cell_voltage) {
+        if (cell_voltages[i] > tmp_max_cell_voltage) {
             BMU.over_voltage = true;
             over_voltage_flag = true;
         }
@@ -654,41 +734,41 @@ void check_cells(void) {
     // Each battery pack is 16S48P, so max_voltage  = 4.19*16 = 67.04V = 67040mV
     // under_voltage = 3.00*16 = 48V = 48000mV
     // Check front IVT first
-    if (front_IVT_voltage > temp_max_battery_pack_voltage_mv)
+    if (ivt_front.voltage1 > temp_max_battery_pack_voltage_mv)
     {
         if (BMU_DEBUG)
         {
             printf("BMU detected over voltage in front IVT.\n");
-            printf("front_IVT_voltage: %d mV \n", front_IVT_voltage);
+            printf("front_IVT_voltage: %d mV \n", ivt_front.voltage1);
         }
         over_voltage_flag = true;
         BMU.over_voltage = true;
     }
-    if (front_IVT_voltage < temp_min_battery_pack_voltage_mv) {
+    if (ivt_front.voltage1 < temp_min_battery_pack_voltage_mv) {
         if (BMU_DEBUG)
             {
                 printf("BMU detected under voltage in front IVT.\n");
-                printf("front_IVT_voltage: %d mV \n", front_IVT_voltage);
+                printf("front_IVT_voltage: %d mV \n", ivt_front.voltage1);
             }
         under_voltage_flag = true;
         BMU.under_voltage = true;
     }
     // Check rear IVT
-    if (rear_IVT_voltage > temp_max_battery_pack_voltage_mv)
+    if (ivt_rear.voltage1 > temp_max_battery_pack_voltage_mv)
     {
         if (BMU_DEBUG)
         {
             printf("BMU detected over voltage in rear IVT.\n");
-            printf("rear_IVT_voltage: %d mV \n", rear_IVT_voltage);
+            printf("rear_IVT_voltage: %d mV \n", ivt_rear.voltage1);
         }
         over_voltage_flag = true;
         BMU.over_voltage = true;
     }
-    if (rear_IVT_voltage < temp_min_battery_pack_voltage_mv) {
+    if (ivt_rear.voltage1 < temp_min_battery_pack_voltage_mv) {
         if (BMU_DEBUG)
             {
                 printf("BMU detected under voltage in rear IVT.\n");
-                printf("rear_IVT_voltage: %d mV \n", rear_IVT_voltage);
+                printf("rear_IVT_voltage: %d mV \n", ivt_rear.voltage1);
             }
         under_voltage_flag = true;
         BMU.under_voltage = true;
@@ -709,44 +789,44 @@ void check_cells(void) {
     */
 
     // Monitoring temperature of front IVT, convert to degree celsius first 
-    if ((front_IVT_temperature*0.1) > MAX_IVT_TEMPERATURE)
+    if ((ivt_front.temperature*0.1) > MAX_IVT_TEMPERATURE)
     {
         if(BMU_DEBUG)
         {
             printf("BMU detected over temperature in front IVT. \n");
-            printf("front_IVT_temperature: %.2f C \n", (front_IVT_temperature*0.1));
+            printf("front_IVT_temperature: %.2f C \n", (ivt_front.temperature*0.1));
         }
         over_temperature_flag = true;
         BMU.over_temperature = true;
     }
-    if ((front_IVT_temperature*0.1) < MIN_IVT_TEMPERATURE) 
+    if ((ivt_front.temperature*0.1) < MIN_IVT_TEMPERATURE) 
     {
         if(BMU_DEBUG)
         {
             printf("BMU detected under temperature in front IVT. \n");
-            printf("front_IVT_temperature: %.2f C \n", (front_IVT_temperature*0.1));
+            printf("front_IVT_temperature: %.2f C \n", (ivt_front.temperature*0.1));
         }
         under_voltage_flag = true;
         BMU.under_temperature = true;
     }
 
     // Monitoring temperature of rear IVT, convert to degree celsius first 
-    if ((rear_IVT_temperature*0.1) > MAX_IVT_TEMPERATURE)
+    if ((ivt_rear.temperature*0.1) > MAX_IVT_TEMPERATURE)
     {
         if(BMU_DEBUG)
         {
             printf("BMU detected over temperature in rear IVT. \n");
-            printf("rear_IVT_temperature: %.2f C \n", (rear_IVT_temperature*0.1));
+            printf("rear_IVT_temperature: %.2f C \n", (ivt_rear.temperature*0.1));
         }
         over_temperature_flag = true;
         BMU.over_temperature = true;
     }
-    if ((rear_IVT_temperature*0.1) < MIN_IVT_TEMPERATURE) 
+    if ((ivt_rear.temperature*0.1) < MIN_IVT_TEMPERATURE) 
     {
         if(BMU_DEBUG)
         {
             printf("BMU detected under temperature in rear IVT. \n");
-            printf("front_IVT_temperature: %.2f C \n", (front_IVT_temperature*0.1));
+            printf("front_IVT_temperature: %.2f C \n", (ivt_rear.temperature*0.1));
         }
         under_temperature_flag = true;
         BMU.under_temperature = true;
@@ -756,6 +836,7 @@ void check_cells(void) {
         BMU.under_temperature = false;
         BMU.over_temperature = false;
     }
+
 
     /*
     //Same thing as the voltage, except now for temperature.
@@ -845,13 +926,19 @@ void update_BMU_status_array(void) {
     //If there was an error, turn off the ignition and clear the safe to drive flag
     if(error_flag) {
         BMU.safe_to_drive = false;
-        ignition = false;
         BMU_status_array[0] &= ~(1<<5);
+        safe_indic = 0;
+        if (ignition_demand)
+        {                
+            ignition_demand = false;
+            previous_ignition_demand = true;
+        }
     }
     //If no errors, tell us it's safe to drive
     else {
         BMU.safe_to_drive = true;
         BMU_status_array[0] |= 1<<5;
+        safe_indic = 1;
     }
     //Charging flag
     if(BMU.charging_state)
